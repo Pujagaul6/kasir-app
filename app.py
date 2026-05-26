@@ -5,11 +5,14 @@ Flask + SQLite, single file
 Port: 5050
 """
 
-import os, sqlite3, json, csv, io
+import os, sqlite3, json, csv, io, secrets
 from datetime import datetime, timedelta
-from flask import Flask, request, redirect, url_for, render_template_string, jsonify, Response
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+from flask import Flask, request, redirect, url_for, render_template_string, jsonify, Response, session
 
 app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kasir.db")
 
 # ─── DATABASE ─────────────────────────────────────────────────────────
@@ -67,6 +70,58 @@ def init_db():
             notes TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'kasir',
+            name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS customers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            phone TEXT,
+            address TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS debts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            transaction_id INTEGER,
+            total_amount INTEGER NOT NULL,
+            paid_amount INTEGER NOT NULL DEFAULT 0,
+            remaining INTEGER NOT NULL,
+            status TEXT DEFAULT 'unpaid',
+            due_date TEXT,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (customer_id) REFERENCES customers(id),
+            FOREIGN KEY (transaction_id) REFERENCES transactions(id)
+        );
+        CREATE TABLE IF NOT EXISTS returns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            product_name TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            reason TEXT,
+            user_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS debt_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            debt_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT,
+            FOREIGN KEY (debt_id) REFERENCES debts(id)
+        );
     """)
     # Seed sample products if empty
     if conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
@@ -83,6 +138,43 @@ def init_db():
             ("Beras 5kg", 62000, 10),
         ]
         conn.executemany("INSERT INTO products (name, price, stock) VALUES (?, ?, ?)", samples)
+    # Migrate existing tables
+    try:
+        conn.execute("ALTER TABLE products ADD COLUMN cost_price INTEGER NOT NULL DEFAULT 0")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE transactions ADD COLUMN discount INTEGER NOT NULL DEFAULT 0")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE transactions ADD COLUMN discount_type TEXT DEFAULT 'rupiah'")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE transactions ADD COLUMN tax_amount INTEGER NOT NULL DEFAULT 0")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE transactions ADD COLUMN user_id INTEGER")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE transactions ADD COLUMN customer_id INTEGER")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE transactions ADD COLUMN is_debt INTEGER NOT NULL DEFAULT 0")
+    except: pass
+
+    # Seed default settings if empty
+    if conn.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
+        defaults = [
+            ("store_name", "Toko Saya"),
+            ("store_address", ""),
+            ("store_phone", ""),
+            ("store_footer", "Terima kasih atas kunjungan Anda!"),
+        ]
+        conn.executemany("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", defaults)
+    # Seed admin user if empty
+    if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        conn.execute("INSERT INTO users (username, password, role, name) VALUES (?, ?, ?, ?)",
+            ("admin", generate_password_hash("admin123"), "admin", "Administrator"))
+    # Seed default settings
     conn.commit()
     conn.close()
 
@@ -96,7 +188,73 @@ def rupiah(val):
 def now_str():
     return datetime.now().strftime("%d/%m/%Y %H:%M")
 
+def get_setting(key, default=""):
+    conn = get_db()
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+def set_setting(key, value):
+    conn = get_db()
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+def get_current_user():
+    if 'user_id' not in session:
+        return None
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (session['user_id'],)).fetchone()
+    conn.close()
+    return user
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated
+
 # ─── TEMPLATES ────────────────────────────────────────────────────────
+LOGIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — Kasir App</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gradient-to-br from-indigo-600 to-purple-700 min-h-screen flex items-center justify-center">
+    <div class="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-md">
+        <div class="text-center mb-8">
+            <div class="text-4xl mb-2">🛒</div>
+            <h1 class="text-2xl font-bold text-gray-800">Kasir App</h1>
+            <p class="text-gray-500 text-sm">Silakan login untuk melanjutkan</p>
+        </div>
+        {% if error %}
+        <div class="bg-red-50 text-red-600 px-4 py-3 rounded-lg mb-4 text-sm">{{ error }}</div>
+        {% endif %}
+        <form method="POST">
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1">Username</label>
+                <input type="text" name="username" required class="w-full border rounded-lg px-4 py-3 text-lg" placeholder="Masukkan username" autofocus>
+            </div>
+            <div class="mb-6">
+                <label class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                <input type="password" name="password" required class="w-full border rounded-lg px-4 py-3 text-lg" placeholder="Masukkan password">
+            </div>
+            <button type="submit" class="w-full bg-indigo-600 text-white py-3 rounded-lg font-semibold text-lg hover:bg-indigo-700 transition">
+                🔐 Login
+            </button>
+        </form>
+        <p class="text-center text-xs text-gray-400 mt-6">Default: admin / admin123</p>
+    </div>
+</body>
+</html>
+'''
+
 LAYOUT = '''
 <!DOCTYPE html>
 <html lang="id">
@@ -106,7 +264,23 @@ LAYOUT = '''
     <title>{{ title }} — Kasir App</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        @media print { .no-print { display: none !important; } }
+        @media print {
+            .no-print { display: none !important; }
+            body { background: white !important; margin: 0; padding: 0; }
+            #receiptArea {
+                width: 72mm; /* 80mm thermal */
+                margin: 0; padding: 8px;
+                font-family: 'Courier New', monospace;
+                font-size: 11px; line-height: 1.3;
+                box-shadow: none; border: none;
+            }
+            #receiptArea .text-xl { font-size: 14px; }
+            #receiptArea .text-lg { font-size: 12px; }
+            #receiptArea .border-dashed { border-style: dashed; }
+        }
+        @media print and (max-width: 58mm) {
+            #receiptArea { width: 52mm; font-size: 10px; }
+        }
         .toast { position: fixed; top: 1rem; right: 1rem; z-index: 9999; padding: 1rem 1.5rem;
                  border-radius: 0.5rem; color: white; font-weight: 600; opacity: 0;
                  transition: opacity 0.3s; }
@@ -146,8 +320,20 @@ LAYOUT = '''
                 <a href="/pembukuan" class="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-indigo-700 {{ 'bg-indigo-700' if page=='pembukuan' else '' }}">
                     <span>💰</span> Pembukuan
                 </a>
+                <a href="/piutang" class="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-indigo-700 {{ 'bg-indigo-700' if page=='piutang' else '' }}">
+                    <span>📝</span> Piutang
+                </a>
+                <a href="/retur" class="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-indigo-700 {{ 'bg-indigo-700' if page=='retur' else '' }}">
+                    <span>📦</span> Retur
+                </a>
+                <a href="/users" class="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-indigo-700 {{ 'bg-indigo-700' if page=='users' else '' }}">
+                    <span>👥</span> Kelola User
+                </a>
                 <a href="/backup" class="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-indigo-700 {{ 'bg-indigo-700' if page=='backup' else '' }}">
                     <span>💾</span> Backup & Restore
+                </a>
+                <a href="/settings" class="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-indigo-700 {{ 'bg-indigo-700' if page=='settings' else '' }}">
+                    <span>⚙️</span> Pengaturan
                 </a>
             </div>
         </nav>
@@ -158,7 +344,13 @@ LAYOUT = '''
             <div class="bg-white shadow-sm px-6 py-3 flex items-center justify-between no-print">
                 <button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full')" class="lg:hidden text-2xl">☰</button>
                 <h1 class="text-xl font-semibold text-gray-800">{{ title }}</h1>
-                <span class="text-sm text-gray-500">{{ now }}</span>
+                <div class="flex items-center gap-4">
+                    <span class="text-sm text-gray-500">{{ now }}</span>
+                    {% if session.get('user_name') %}
+                    <span class="text-sm text-indigo-600 font-medium">👤 {{ session.get('user_name') }}</span>
+                    <a href="/logout" class="text-sm text-red-500 hover:underline">Logout</a>
+                    {% endif %}
+                </div>
             </div>
             <div class="p-6">
                 {{ content|safe }}
@@ -184,7 +376,29 @@ LAYOUT = '''
 
 # ─── ROUTES ───────────────────────────────────────────────────────────
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        conn = get_db()
+        user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        conn.close()
+        if user and check_password_hash(user["password"], password):
+            session["user_id"] = user["id"]
+            session["user_role"] = user["role"]
+            session["user_name"] = user["name"]
+            return redirect(url_for("dashboard"))
+        return render_template_string(LOGIN_TEMPLATE, error="Username atau password salah!")
+    return render_template_string(LOGIN_TEMPLATE, error=None)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
 @app.route("/")
+@login_required
 def dashboard():
     conn = get_db()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -214,6 +428,10 @@ def dashboard():
     stock_data = conn.execute("SELECT COALESCE(SUM(price * stock), 0) as total_value, COALESCE(SUM(stock), 0) as total_items FROM products").fetchone()
     stock_value = stock_data["total_value"]
     stock_items = stock_data["total_items"]
+
+    # Piutang summary
+    total_piutang = conn.execute("SELECT COALESCE(SUM(remaining),0) as s FROM debts WHERE status != 'paid'").fetchone()["s"]
+    piutang_count = conn.execute("SELECT COUNT(*) as c FROM debts WHERE status != 'paid'").fetchone()["c"]
 
     # This month finance
     month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
@@ -252,6 +470,13 @@ def dashboard():
             <div class="text-3xl font-bold {{ 'text-red-500' if low_stock > 0 else 'text-gray-400' }} mt-1">{{ low_stock }}</div>
             <div class="text-sm text-gray-400">dari {{ total_products }} produk</div>
         </div>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+        <a href="/piutang" class="bg-white rounded-xl shadow p-6 hover:shadow-md transition">
+            <div class="text-gray-500 text-sm">📝 Total Piutang</div>
+            <div class="text-3xl font-bold {{ 'text-red-500' if total_piutang > 0 else 'text-gray-400' }} mt-1">{{ r(total_piutang) }}</div>
+            <div class="text-sm text-gray-400">{{ piutang_count }} transaksi belum lunas</div>
+        </a>
     </div>
 
     <!-- Stock Value Section -->
@@ -303,12 +528,13 @@ def dashboard():
         total_products=total_products, low_stock=low_stock,
         stock_value=stock_value, stock_items=stock_items,
         month_income=month_income, month_expense=month_expense,
-        recent=recent, r=rupiah)
+        recent=recent, r=rupiah, total_piutang=total_piutang, piutang_count=piutang_count)
 
     return render_template_string(LAYOUT, title="Dashboard", page="dashboard", content=content, now=now_str())
 
 
 @app.route("/products", methods=["GET", "POST"])
+@login_required
 def products():
     conn = get_db()
 
@@ -373,15 +599,17 @@ def products():
                     <th class="px-4 py-3 text-right text-sm font-semibold text-gray-600">Stok</th>
                     <th class="px-4 py-3 text-center text-sm font-semibold text-gray-600 no-print">Aksi</th>
                 </tr>
-            </thead>
-            <tbody class="divide-y">
-                {% for p in products %}
-                <tr class="hover:bg-gray-50">
-                    <td class="px-4 py-3">{{ p.name }}</td>
-                    <td class="px-4 py-3 text-right">{{ r(p.price) }}</td>
-                    <td class="px-4 py-3 text-right">
-                        <span class="{{ 'text-red-500 font-bold' if p.stock <= 5 else '' }}">{{ p.stock }}</span>
-                    </td>
+<thead><tr class="border-b"><th class="text-left py-2">Nama</th><th class="text-right py-2">Harga Jual</th><th class="text-right py-2">HPP</th><th class="text-right py-2">Margin</th><th class="text-right py-2">Stok</th><th class="text-right py-2">Aksi</th></tr></thead>
+                    <tbody>
+                    {% for p in products %}
+                    <tr class="border-b hover:bg-gray-50">
+                        <td class="py-2 font-medium">{{ p.name }}</td>
+                        <td class="py-2 text-right">{{ r(p.price) }}</td>
+                        <td class="py-2 text-right text-gray-500">{{ r(p.cost_price or 0) }}</td>
+                        <td class="py-2 text-right text-green-600">{{ r(p.price - (p.cost_price or 0)) }}</td>
+                        <td class="py-2 text-right">
+                            <span class="{{ 'text-red-500 font-bold' if p.stock <= 5 else '' }}">{{ p.stock }}</span>
+                        </td>
                     <td class="px-4 py-3 text-center no-print">
                         <button onclick="editProduct({{ p.id }}, '{{ p.name }}', {{ p.price }})" class="text-blue-600 hover:underline text-sm mr-2">✏️ Edit</button>
                         <button onclick="stockProduct({{ p.id }}, '{{ p.name }}', {{ p.stock }})" class="text-green-600 hover:underline text-sm mr-2">📦 Stok</button>
@@ -476,7 +704,112 @@ def products():
     return render_template_string(LAYOUT, title="Produk & Stok", page="products", content=content, now=now_str())
 
 
+@app.route("/settings", methods=["GET", "POST"])
+@login_required
+def settings():
+    store_name = get_setting("store_name", "Toko Saya")
+    store_address = get_setting("store_address", "")
+    store_phone = get_setting("store_phone", "")
+    store_footer = get_setting("store_footer", "Terima kasih atas kunjungan Anda!")
+    tax_enabled = get_setting("tax_enabled", "off")
+    tax_rate = get_setting("tax_rate", "11")
+
+    if request.method == "POST":
+        for key in ["store_name","store_address","store_phone","store_footer","tax_rate"]:
+            if key in request.form:
+                set_setting(key, request.form[key])
+        set_setting("tax_enabled", "on" if request.form.get("tax_enabled") else "off")
+        return redirect(url_for("settings"))
+
+    store_name = get_setting("store_name", "Toko Saya")
+    store_address = get_setting("store_address", "")
+    store_phone = get_setting("store_phone", "")
+    store_footer = get_setting("store_footer", "Terima kasih atas kunjungan Anda!")
+
+    content = render_template_string('''
+    <div class="max-w-2xl mx-auto">
+        <div class="bg-white rounded-xl shadow p-6">
+            <h3 class="text-lg font-semibold mb-6">🏪 Pengaturan Toko</h3>
+            <form method="POST">
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Nama Toko</label>
+                        <input name="store_name" value="{{ store_name }}" class="w-full border rounded-lg px-4 py-3 text-lg" placeholder="Nama tokomu">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Alamat</label>
+                        <input name="store_address" value="{{ store_address }}" class="w-full border rounded-lg px-4 py-3" placeholder="Jl. Contoh No. 123, Kota">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">No. HP / WhatsApp</label>
+                        <input name="store_phone" value="{{ store_phone }}" class="w-full border rounded-lg px-4 py-3" placeholder="08xxxxxxxxxx">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Footer Struk</label>
+                        <input name="store_footer" value="{{ store_footer }}" class="w-full border rounded-lg px-4 py-3" placeholder="Pesan di bawah struk">
+                    </div>
+                </div>
+                <hr class="my-6">
+                <h4 class="font-semibold text-gray-700 mb-4">🧾 Pengaturan Pajak (PPN)</h4>
+                <div class="space-y-4">
+                    <div class="flex items-center gap-3">
+                        <input type="checkbox" name="tax_enabled" id="taxToggle" {{ 'checked' if tax_enabled=='on' else '' }} class="w-5 h-5">
+                        <label for="taxToggle" class="text-sm font-medium text-gray-700">Aktifkan PPN</label>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Tarif PPN (%)</label>
+                        <input name="tax_rate" type="number" value="{{ tax_rate }}" min="0" max="100" class="w-full border rounded-lg px-4 py-3" placeholder="11">
+                        <p class="text-xs text-gray-400 mt-1">Default: 11% (PPN Indonesia)</p>
+                    </div>
+                </div>
+                <button type="submit" class="mt-6 w-full bg-indigo-600 text-white py-3 rounded-lg hover:bg-indigo-700 font-semibold">
+                    💾 Simpan Pengaturan
+                </button>
+            </form>
+        </div>
+
+        <!-- Preview Struk -->
+        <div class="bg-white rounded-xl shadow p-6 mt-6">
+            <h3 class="text-lg font-semibold mb-4">👁️ Preview Struk</h3>
+            <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 max-w-sm mx-auto font-mono text-sm">
+                <div class="text-center mb-4">
+                    <div class="text-xl font-bold">{{ store_name }}</div>
+                    {% if store_address %}<div class="text-xs">{{ store_address }}</div>{% endif %}
+                    {% if store_phone %}<div class="text-xs">Telp: {{ store_phone }}</div>{% endif %}
+                </div>
+                <div class="border-t border-dashed my-2"></div>
+                <div class="flex justify-between">
+                    <span>Contoh Item x2</span>
+                    <span>Rp 10.000</span>
+                </div>
+                <div class="flex justify-between">
+                    <span>Contoh Item x1</span>
+                    <span>Rp 5.000</span>
+                </div>
+                <div class="border-t border-dashed my-2"></div>
+                <div class="flex justify-between font-bold">
+                    <span>TOTAL</span>
+                    <span>Rp 15.000</span>
+                </div>
+                <div class="flex justify-between text-xs mt-1">
+                    <span>Bayar</span><span>Rp 20.000</span>
+                </div>
+                <div class="flex justify-between text-xs">
+                    <span>Kembali</span><span>Rp 5.000</span>
+                </div>
+                <div class="border-t border-dashed my-2"></div>
+                <div class="text-center text-xs mt-4">{{ store_footer }}</div>
+            </div>
+        </div>
+    </div>
+    ''', store_name=store_name, store_address=store_address,
+        store_phone=store_phone, store_footer=store_footer)
+
+    return render_template_string(LAYOUT, title="Pengaturan", page="settings", content=content, now=now_str())
+
+
 @app.route("/import", methods=["GET", "POST"])
+@login_required
 def import_products():
     conn = get_db()
     result = None
@@ -633,28 +966,51 @@ def template_csv():
 
 
 @app.route("/kasir", methods=["GET", "POST"])
+@login_required
 def kasir():
     conn = get_db()
 
     if request.method == "POST":
         data = json.loads(request.form.get("cart", "[]"))
         payment = int(request.form.get("payment", 0))
+        discount = int(request.form.get("discount", 0))
+        discount_type = request.form.get("discount_type", "rupiah")
+        customer_id = request.form.get("customer_id", "")
+        is_debt = 1 if request.form.get("is_debt") else 0
 
         if not data:
             conn.close()
             return redirect(url_for("kasir"))
 
-        total = sum(item["price"] * item["qty"] for item in data)
-        change = payment - total
+        subtotal = sum(item["price"] * item["qty"] for item in data)
 
-        if payment < total:
-            conn.close()
-            return redirect(url_for("kasir"))
+        # Apply discount
+        if discount_type == "percent":
+            disc_amount = subtotal * discount // 100
+        else:
+            disc_amount = discount
+        after_discount = max(0, subtotal - disc_amount)
+
+        # Apply tax
+        tax_enabled = get_setting("tax_enabled", "off")
+        tax_rate = int(get_setting("tax_rate", "11"))
+        tax_amount = 0
+        if tax_enabled == "on":
+            tax_amount = after_discount * tax_rate // 100
+
+        total = after_discount + tax_amount
+        change = max(0, payment - total)
+
+        if is_debt:
+            change = 0
+            payment = 0
 
         # Create transaction
+        uid = session.get("user_id")
+        cid = int(customer_id) if customer_id else None
         cur = conn.execute(
-            "INSERT INTO transactions (total, payment, change_amount) VALUES (?, ?, ?)",
-            (total, payment, change)
+            "INSERT INTO transactions (total, payment, change_amount, discount, discount_type, tax_amount, user_id, customer_id, is_debt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (total, payment, change, disc_amount, discount_type, tax_amount, uid, cid, is_debt)
         )
         tid = cur.lastrowid
 
@@ -675,12 +1031,22 @@ def kasir():
             (total, f"Penjualan #{tid}")
         )
 
+        # Create debt record if hutang
+        if is_debt and cid:
+            conn.execute(
+                "INSERT INTO debts (customer_id, transaction_id, total_amount, paid_amount, remaining, status) VALUES (?, ?, ?, 0, ?, 'unpaid')",
+                (cid, tid, total, total)
+            )
+
         conn.commit()
         conn.close()
 
         return redirect(url_for("receipt", tid=tid))
 
     products = conn.execute("SELECT * FROM products WHERE stock > 0 ORDER BY name").fetchall()
+    customers = conn.execute("SELECT * FROM customers ORDER BY name").fetchall()
+    tax_enabled = get_setting('tax_enabled', 'off')
+    tax_rate = int(get_setting('tax_rate', '11'))
     conn.close()
 
     content = render_template_string('''
@@ -717,8 +1083,35 @@ def kasir():
             <form method="POST" id="checkoutForm" onsubmit="return prepareCheckout()">
                 <input type="hidden" name="cart" id="cartData">
                 <div class="mb-3">
+                    <label class="text-sm text-gray-600">Diskon</label>
+                    <div class="flex gap-2">
+                        <input type="number" name="discount" id="discountInput" min="0" value="0" class="flex-1 border rounded-lg px-3 py-2" placeholder="0" oninput="calcTotal()">
+                        <select name="discount_type" id="discountType" class="border rounded-lg px-2 py-2 text-sm" onchange="calcTotal()">
+                            <option value="rupiah">Rp</option>
+                            <option value="percent">%</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label class="text-sm text-gray-600">Pelanggan (opsional)</label>
+                    <select name="customer_id" id="customerSelect" class="w-full border rounded-lg px-3 py-2 text-sm" onchange="calcChange()">
+                        <option value="">-- Umum --</option>
+                        {% for c in customers %}<option value="{{ c.id }}">{{ c.name }}{% if c.phone %} ({{ c.phone }}){% endif %}</option>{% endfor %}
+                    </select>
+                </div>
+                <div class="mb-3 flex items-center gap-2">
+                    <input type="checkbox" name="is_debt" id="isDebt" class="w-4 h-4">
+                    <label for="isDebt" class="text-sm text-gray-600">📝 Bayar Nanti (Hutang)</label>
+                </div>
+                <div class="mb-3">
                     <label class="text-sm text-gray-600">Uang Bayar</label>
                     <input type="number" name="payment" id="paymentInput" min="0" class="w-full border rounded-lg px-3 py-2 text-lg" placeholder="0" oninput="calcChange()">
+                </div>
+                <div class="space-y-1 text-sm mb-3" id="summarySection" style="display:none">
+                    <div class="flex justify-between"><span class="text-gray-500">Subtotal</span><span id="summSubtotal">Rp 0</span></div>
+                    <div class="flex justify-between" id="summDiscRow"><span class="text-gray-500">Diskon</span><span id="summDiscount" class="text-red-500">- Rp 0</span></div>
+                    <div class="flex justify-between" id="summTaxRow" style="display:none"><span class="text-gray-500">PPN</span><span id="summTax">Rp 0</span></div>
+                    <div class="flex justify-between font-bold text-lg"><span>Total</span><span id="summTotal" class="text-indigo-600">Rp 0</span></div>
                 </div>
                 <div class="flex justify-between text-sm mb-4" id="changeRow" style="display:none">
                     <span class="text-gray-500">Kembalian</span>
@@ -800,14 +1193,51 @@ def kasir():
             container.innerHTML = html;
             totalEl.textContent = formatRupiah(total);
             document.getElementById('payBtn').disabled = false;
+            calcTotal();
+            calcChange();
+        }
+
+        function getFinalTotal() {
+            const subtotal = cart.reduce((s, i) => s + i.price * i.qty, 0);
+            const discVal = parseInt(document.getElementById('discountInput').value) || 0;
+            const discType = document.getElementById('discountType').value;
+            const disc = discType === 'percent' ? Math.floor(subtotal * discVal / 100) : discVal;
+            const afterDisc = Math.max(0, subtotal - disc);
+            const taxEnabled = {{ 'true' if tax_enabled == 'on' else 'false' }};
+            const taxRate = {{ tax_rate }};
+            const tax = taxEnabled ? Math.floor(afterDisc * taxRate / 100) : 0;
+            return { subtotal, disc, afterDisc, tax, total: afterDisc + tax, taxEnabled };
+        }
+
+        function calcTotal() {
+            const f = getFinalTotal();
+            const summ = document.getElementById('summarySection');
+            if (cart.length === 0) { summ.style.display = 'none'; return; }
+            summ.style.display = 'block';
+            document.getElementById('summSubtotal').textContent = formatRupiah(f.subtotal);
+            document.getElementById('summDiscount').textContent = '- ' + formatRupiah(f.disc);
+            document.getElementById('summDiscRow').style.display = f.disc > 0 ? 'flex' : 'none';
+            document.getElementById('summTaxRow').style.display = f.taxEnabled ? 'flex' : 'none';
+            document.getElementById('summTax').textContent = formatRupiah(f.tax);
+            document.getElementById('summTotal').textContent = formatRupiah(f.total);
             calcChange();
         }
 
         function calcChange() {
-            const total = cart.reduce((s, i) => s + i.price * i.qty, 0);
+            const f = getFinalTotal();
+            const isDebt = document.getElementById('isDebt').checked;
             const payment = parseInt(document.getElementById('paymentInput').value) || 0;
-            const change = payment - total;
+            const change = payment - f.total;
+            const payInput = document.getElementById('paymentInput');
             const row = document.getElementById('changeRow');
+            if (isDebt) {
+                payInput.disabled = true; payInput.value = '';
+                row.style.display = 'none';
+                document.getElementById('payBtn').disabled = cart.length === 0 || !document.getElementById('customerSelect').value;
+                return;
+            } else {
+                payInput.disabled = false;
+            }
             if (payment > 0) {
                 row.style.display = 'flex';
                 document.getElementById('changeAmount').textContent = formatRupiah(Math.max(0, change));
@@ -815,16 +1245,25 @@ def kasir():
             } else {
                 row.style.display = 'none';
             }
+            document.getElementById('payBtn').disabled = cart.length === 0 || change < 0;
         }
 
         function prepareCheckout() {
             if (cart.length === 0) return false;
-            const total = cart.reduce((s, i) => s + i.price * i.qty, 0);
-            const payment = parseInt(document.getElementById('paymentInput').value) || 0;
-            if (payment < total) { showToast('Uang kurang!', 'error'); return false; }
+            const f = getFinalTotal();
+            const isDebt = document.getElementById('isDebt').checked;
+            if (!isDebt) {
+                const payment = parseInt(document.getElementById('paymentInput').value) || 0;
+                if (payment < f.total) { showToast('Uang kurang!', 'error'); return false; }
+            }
+            if (isDebt && !document.getElementById('customerSelect').value) { showToast('Pilih pelanggan untuk hutang!', 'error'); return false; }
             document.getElementById('cartData').value = JSON.stringify(cart);
             return true;
         }
+
+        document.getElementById('isDebt').addEventListener('change', calcChange);
+        document.getElementById('discountInput').addEventListener('input', calcTotal);
+        document.getElementById('discountType').addEventListener('change', calcTotal);
 
         function filterProducts() {
             const q = document.getElementById('search').value.toLowerCase();
@@ -833,12 +1272,13 @@ def kasir():
             });
         }
     </script>
-    ''', products=products, r=rupiah)
+    ''', products=products, customers=customers, r=rupiah, tax_enabled=tax_enabled, tax_rate=tax_rate)
 
     return render_template_string(LAYOUT, title="Kasir (POS)", page="kasir", content=content, now=now_str())
 
 
 @app.route("/receipt/<int:tid>")
+@login_required
 def receipt(tid):
     conn = get_db()
     trx = conn.execute("SELECT * FROM transactions WHERE id=?", (tid,)).fetchone()
@@ -847,49 +1287,193 @@ def receipt(tid):
         return "Transaksi tidak ditemukan", 404
 
     items = conn.execute("SELECT * FROM transaction_items WHERE transaction_id=?", (tid,)).fetchall()
+
+    # Get store settings
+    store_name = conn.execute("SELECT value FROM settings WHERE key='store_name'").fetchone()
+    store_name = store_name["value"] if store_name else "Kasir App"
+    store_address = conn.execute("SELECT value FROM settings WHERE key='store_address'").fetchone()
+    store_address = store_address["value"] if store_address else ""
+    store_phone = conn.execute("SELECT value FROM settings WHERE key='store_phone'").fetchone()
+    store_phone = store_phone["value"] if store_phone else ""
+    store_footer = conn.execute("SELECT value FROM settings WHERE key='store_footer'").fetchone()
+    store_footer = store_footer["value"] if store_footer else "Terima kasih atas kunjungan Anda!"
+
+    # Get cashier name
+    cashier_name = ""
+    if trx["user_id"]:
+        u = conn.execute("SELECT name FROM users WHERE id=?", (trx["user_id"],)).fetchone()
+        cashier_name = u["name"] if u else ""
+
+    # Get customer name
+    customer_name = ""
+    if trx["customer_id"]:
+        c = conn.execute("SELECT name FROM customers WHERE id=?", (trx["customer_id"],)).fetchone()
+        customer_name = c["name"] if c else ""
+
     conn.close()
+
+    # Calculate subtotal (before discount/tax)
+    subtotal = sum(i["subtotal"] for i in items)
+    disc_amount = trx["discount"] or 0
+    if trx.get("discount_type") == "percent":
+        disc_amount = subtotal * (trx["discount"] or 0) // 100
 
     content = render_template_string('''
     <div class="max-w-md mx-auto bg-white rounded-xl shadow p-6" id="receiptArea">
         <div class="text-center mb-4">
-            <h2 class="text-xl font-bold">🛒 Kasir App</h2>
-            <p class="text-sm text-gray-500">Struk Pembelian</p>
+            <h2 class="text-xl font-bold">{{ store_name }}</h2>
+            {% if store_address %}<p class="text-xs text-gray-500">{{ store_address }}</p>{% endif %}
+            {% if store_phone %}<p class="text-xs text-gray-500">Telp: {{ store_phone }}</p>{% endif %}
         </div>
-        <div class="text-sm text-gray-500 mb-4">
+        <div class="text-xs text-gray-500 mb-3">
             <div>No: #{{ trx.id }}</div>
             <div>Tgl: {{ trx.created_at }}</div>
+            {% if cashier_name %}<div>Kasir: {{ cashier_name }}</div>{% endif %}
+            {% if customer_name %}<div>Pelanggan: {{ customer_name }}</div>{% endif %}
         </div>
-        <hr class="my-3">
+        <div class="border-t border-dashed border-gray-400 my-2"></div>
         {% for item in items %}
         <div class="flex justify-between text-sm mb-1">
             <span>{{ item.product_name }} × {{ item.quantity }}</span>
             <span>{{ r(item.subtotal) }}</span>
         </div>
         {% endfor %}
-        <hr class="my-3">
+        <div class="border-t border-dashed border-gray-400 my-2"></div>
+        <div class="flex justify-between text-sm">
+            <span>Subtotal</span><span>{{ r(subtotal) }}</span>
+        </div>
+        {% if trx.discount and trx.discount > 0 %}
+        <div class="flex justify-between text-sm">
+            <span>Diskon{% if trx.discount_type == 'percent' %} ({{ trx.discount }}%){% endif %}</span>
+            <span class="text-red-500">- {{ r(disc_amount) }}</span>
+        </div>
+        {% endif %}
+        {% if trx.tax_amount and trx.tax_amount > 0 %}
+        <div class="flex justify-between text-sm">
+            <span>PPN</span><span>{{ r(trx.tax_amount) }}</span>
+        </div>
+        {% endif %}
         <div class="flex justify-between font-bold text-lg">
             <span>TOTAL</span>
             <span>{{ r(trx.total) }}</span>
         </div>
+        {% if trx.is_debt %}
+        <div class="flex justify-between text-sm text-red-500 font-semibold">
+            <span>STATUS</span><span>📝 BELUM LUNAS</span>
+        </div>
+        {% else %}
         <div class="flex justify-between text-sm mt-1">
             <span>Bayar</span><span>{{ r(trx.payment) }}</span>
         </div>
         <div class="flex justify-between text-sm">
             <span>Kembalian</span><span>{{ r(trx.change_amount) }}</span>
         </div>
-        <hr class="my-3">
-        <p class="text-center text-sm text-gray-400">Terima kasih! 🙏</p>
+        {% endif %}
+        <div class="border-t border-dashed border-gray-400 my-2"></div>
+        <p class="text-center text-xs text-gray-500 mt-4">{{ store_footer }}</p>
     </div>
     <div class="flex gap-4 mt-6 justify-center no-print">
         <button onclick="window.print()" class="bg-indigo-600 text-white px-6 py-2 rounded-lg">🖨️ Cetak</button>
         <a href="/kasir" class="bg-gray-200 px-6 py-2 rounded-lg">← Kembali</a>
     </div>
-    ''', trx=trx, items=items, r=rupiah)
+    ''', trx=trx, items=items, r=rupiah,
+        store_name=store_name, store_address=store_address,
+        store_phone=store_phone, store_footer=store_footer,
+        cashier_name=cashier_name, customer_name=customer_name,
+        subtotal=subtotal, disc_amount=disc_amount)
 
     return render_template_string(LAYOUT, title=f"Struk #{tid}", page="kasir", content=content, now=now_str())
 
 
+@app.route("/transaction/delete/<int:tid>", methods=["POST"])
+@login_required
+def delete_transaction(tid):
+    if session.get("user_role") != "admin":
+        return "Akses ditolak", 403
+    conn = get_db()
+    trx = conn.execute("SELECT * FROM transactions WHERE id=?", (tid,)).fetchone()
+    if trx:
+        items = conn.execute("SELECT * FROM transaction_items WHERE transaction_id=?", (tid,)).fetchall()
+        for item in items:
+            conn.execute("UPDATE products SET stock = stock + ?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (item["quantity"], item["product_id"]))
+        conn.execute("DELETE FROM transaction_items WHERE transaction_id=?", (tid,))
+        conn.execute("DELETE FROM finance WHERE description LIKE ? AND category='penjualan'", (f"%Penjualan #{tid}",))
+        conn.execute("DELETE FROM debts WHERE transaction_id=?", (tid,))
+        conn.execute("DELETE FROM returns WHERE transaction_id=?", (tid,))
+        conn.execute("DELETE FROM transactions WHERE id=?", (tid,))
+        conn.commit()
+    conn.close()
+    return redirect(url_for("penjualan"))
+
+@app.route("/transaction/edit/<int:tid>", methods=["GET", "POST"])
+@login_required
+def edit_transaction(tid):
+    conn = get_db()
+    trx = conn.execute("SELECT * FROM transactions WHERE id=?", (tid,)).fetchone()
+    if not trx:
+        conn.close()
+        return redirect(url_for("penjualan"))
+    items = conn.execute("SELECT * FROM transaction_items WHERE transaction_id=?", (tid,)).fetchall()
+
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "update_item":
+            item_id = int(request.form.get("item_id", 0))
+            new_qty = int(request.form.get("quantity", 1))
+            item = conn.execute("SELECT * FROM transaction_items WHERE id=?", (item_id,)).fetchone()
+            if item and new_qty > 0:
+                qty_diff = new_qty - item["quantity"]
+                new_subtotal = item["price"] * new_qty
+                conn.execute("UPDATE transaction_items SET quantity=?, subtotal=? WHERE id=?", (new_qty, new_subtotal, item_id))
+                conn.execute("UPDATE products SET stock = MAX(0, stock - ?), updated_at=CURRENT_TIMESTAMP WHERE id=?", (qty_diff, item["product_id"]))
+                all_items = conn.execute("SELECT * FROM transaction_items WHERE transaction_id=?", (tid,)).fetchall()
+                new_total = sum(i["subtotal"] for i in all_items)
+                conn.execute("UPDATE transactions SET total=?, change_amount=MAX(0, payment-?) WHERE id=?", (new_total, new_total, tid))
+                conn.execute("UPDATE finance SET amount=? WHERE description LIKE ? AND category='penjualan'", (new_total, f"%Penjualan #{tid}"))
+                conn.commit()
+        return redirect(url_for("edit_transaction", tid=tid))
+
+    subtotal = sum(i["subtotal"] for i in items)
+    conn.close()
+
+    content = render_template_string('''
+    <div class="max-w-2xl mx-auto">
+        <div class="bg-white rounded-xl shadow p-6">
+            <h3 class="text-lg font-semibold mb-4">✏️ Edit Transaksi #{{ trx.id }}</h3>
+            <div class="text-sm text-gray-500 mb-4">{{ trx.created_at }}</div>
+            <div class="space-y-3">
+                {% for item in items %}
+                <div class="flex items-center justify-between border-b pb-3">
+                    <div>
+                        <div class="font-medium">{{ item.product_name }}</div>
+                        <div class="text-sm text-gray-500">{{ r(item.price) }} × {{ item.quantity }} = {{ r(item.subtotal) }}</div>
+                    </div>
+                    <form method="POST" class="flex gap-2 items-center">
+                        <input type="hidden" name="action" value="update_item">
+                        <input type="hidden" name="item_id" value="{{ item.id }}">
+                        <input type="number" name="quantity" value="{{ item.quantity }}" min="1" class="w-20 border rounded px-2 py-1 text-sm">
+                        <button type="submit" class="text-blue-500 hover:underline text-sm">Update</button>
+                    </form>
+                </div>
+                {% endfor %}
+            </div>
+            <div class="mt-6 pt-4 border-t">
+                <div class="flex justify-between text-lg font-bold">
+                    <span>Total</span><span>{{ r(trx.total) }}</span>
+                </div>
+            </div>
+            <div class="mt-6 flex gap-4">
+                <a href="/penjualan" class="bg-gray-200 px-6 py-2 rounded-lg">← Kembali</a>
+                <a href="/receipt/{{ trx.id }}" class="bg-indigo-600 text-white px-6 py-2 rounded-lg">🖨️ Struk</a>
+            </div>
+        </div>
+    </div>
+    ''', trx=trx, items=items, subtotal=subtotal, r=rupiah)
+    return render_template_string(LAYOUT, title=f"Edit #{tid}", page="penjualan", content=content, now=now_str())
+
 @app.route("/penjualan")
+@login_required
 def penjualan():
     conn = get_db()
 
@@ -943,6 +1527,12 @@ def penjualan():
         </form>
     </div>
 
+    <!-- Export -->
+    <div class="flex gap-3 mb-4 no-print">
+        <a href="/export/penjualan?start={{ start }}&end={{ end }}" class="bg-green-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-green-700">📥 Export Penjualan CSV</a>
+        <a href="/export/pembukuan?start={{ start }}&end={{ end }}" class="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-blue-700">📊 Export Pembukuan CSV</a>
+    </div>
+
     <!-- Stats -->
     <div class="grid grid-cols-3 gap-4 mb-6">
         <div class="bg-white rounded-xl shadow p-4 text-center">
@@ -969,6 +1559,7 @@ def penjualan():
                     <th class="px-4 py-3 text-right text-sm font-semibold text-gray-600">Total</th>
                     <th class="px-4 py-3 text-right text-sm font-semibold text-gray-600">Bayar</th>
                     <th class="px-4 py-3 text-right text-sm font-semibold text-gray-600">Kembali</th>
+                    <th class="px-4 py-3 text-center text-sm font-semibold text-gray-600 no-print">Aksi</th>
                 </tr>
             </thead>
             <tbody class="divide-y">
@@ -979,10 +1570,18 @@ def penjualan():
                     <td class="px-4 py-3 text-right font-semibold">{{ r(t.total) }}</td>
                     <td class="px-4 py-3 text-right">{{ r(t.payment) }}</td>
                     <td class="px-4 py-3 text-right">{{ r(t.change_amount) }}</td>
+                    <td class="px-4 py-3 text-center no-print">
+                        <a href="/transaction/edit/{{ t.id }}" class="text-blue-500 hover:underline text-sm mr-2">✏️</a>
+                        {% if session.get('user_role') == 'admin' %}
+                        <form method="POST" action="/transaction/delete/{{ t.id }}" style="display:inline" onsubmit="return confirm('Hapus transaksi #{{ t.id }}? Stok akan dikembalikan.')">
+                            <button type="submit" class="text-red-500 hover:underline text-sm">🗑️</button>
+                        </form>
+                        {% endif %}
+                    </td>
                 </tr>
                 {% endfor %}
                 {% if not transactions %}
-                <tr><td colspan="5" class="px-4 py-8 text-center text-gray-400">Tidak ada transaksi</td></tr>
+                <tr><td colspan="6" class="px-4 py-8 text-center text-gray-400">Tidak ada transaksi</td></tr>
                 {% endif %}
             </tbody>
         </table>
@@ -993,6 +1592,7 @@ def penjualan():
 
 
 @app.route("/pembukuan", methods=["GET", "POST"])
+@login_required
 def pembukuan():
     conn = get_db()
 
@@ -1179,6 +1779,7 @@ def pembukuan():
 
 
 @app.route("/ppob", methods=["GET", "POST"])
+@login_required
 def ppob():
     conn = get_db()
 
@@ -1433,7 +2034,418 @@ def ppob():
     return render_template_string(LAYOUT, title="PPOB (Token/Pulsa)", page="ppob", content=content, now=now_str())
 
 
+@app.route("/users", methods=["GET", "POST"])
+@login_required
+def users_manage():
+    if session.get("user_role") != "admin":
+        return "Akses ditolak", 403
+    conn = get_db()
+
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "add":
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+            name = request.form.get("name", "").strip()
+            role = request.form.get("role", "kasir")
+            if username and password and name:
+                try:
+                    conn.execute("INSERT INTO users (username, password, role, name) VALUES (?, ?, ?, ?)",
+                        (username, generate_password_hash(password), role, name))
+                    conn.commit()
+                except sqlite3.IntegrityError:
+                    pass
+        elif action == "delete":
+            uid = int(request.form.get("user_id", 0))
+            if uid != session.get("user_id"):
+                conn.execute("DELETE FROM users WHERE id=?", (uid,))
+                conn.commit()
+        elif action == "reset_password":
+            uid = int(request.form.get("user_id", 0))
+            new_pw = request.form.get("new_password", "")
+            if new_pw:
+                conn.execute("UPDATE users SET password=? WHERE id=?", (generate_password_hash(new_pw), uid))
+                conn.commit()
+        return redirect(url_for("users_manage"))
+
+    all_users = conn.execute("SELECT * FROM users ORDER BY id").fetchall()
+    conn.close()
+
+    content = render_template_string('''
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-white rounded-xl shadow p-6">
+            <h3 class="font-semibold text-lg mb-4">👥 Daftar User</h3>
+            <div class="space-y-3">
+            {% for u in all_users %}
+            <div class="border rounded-lg p-4 flex justify-between items-center">
+                <div>
+                    <div class="font-semibold">{{ u.name }}</div>
+                    <div class="text-sm text-gray-500">@{{ u.username }} —
+                        <span class="px-2 py-0.5 rounded text-xs {{ 'bg-indigo-100 text-indigo-700' if u.role=='admin' else 'bg-gray-100 text-gray-700' }}">{{ u.role }}</span>
+                    </div>
+                </div>
+                <div class="flex gap-2">
+                    <form method="POST" class="flex gap-1">
+                        <input type="hidden" name="action" value="reset_password">
+                        <input type="hidden" name="user_id" value="{{ u.id }}">
+                        <input type="password" name="new_password" placeholder="Pass baru" class="border rounded px-2 py-1 text-xs w-24">
+                        <button type="submit" class="text-blue-500 text-xs hover:underline">🔑</button>
+                    </form>
+                    {% if u.id != session.get('user_id') %}
+                    <form method="POST" onsubmit="return confirm('Hapus user?')">
+                        <input type="hidden" name="action" value="delete">
+                        <input type="hidden" name="user_id" value="{{ u.id }}">
+                        <button type="submit" class="text-red-500 text-xs hover:underline">🗑️</button>
+                    </form>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+            </div>
+        </div>
+        <div class="bg-white rounded-xl shadow p-6">
+            <h3 class="font-semibold text-lg mb-4">➕ Tambah User</h3>
+            <form method="POST">
+                <input type="hidden" name="action" value="add">
+                <div class="space-y-3">
+                    <input name="name" required placeholder="Nama lengkap" class="w-full border rounded-lg px-3 py-2">
+                    <input name="username" required placeholder="Username" class="w-full border rounded-lg px-3 py-2">
+                    <input name="password" type="password" required placeholder="Password" class="w-full border rounded-lg px-3 py-2">
+                    <select name="role" class="w-full border rounded-lg px-3 py-2"><option value="kasir">Kasir</option><option value="admin">Admin</option></select>
+                    <button type="submit" class="w-full bg-indigo-600 text-white py-2 rounded-lg hover:bg-indigo-700">Tambah User</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    ''', all_users=all_users)
+
+    return render_template_string(LAYOUT, title="Kelola User", page="users", content=content, now=now_str())
+
+
+@app.route("/piutang", methods=["GET", "POST"])
+@login_required
+def piutang():
+    conn = get_db()
+
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "add_customer":
+            name = request.form.get("name", "").strip()
+            phone = request.form.get("phone", "").strip()
+            address = request.form.get("address", "").strip()
+            if name:
+                conn.execute("INSERT INTO customers (name, phone, address) VALUES (?, ?, ?)", (name, phone, address))
+                conn.commit()
+        elif action == "pay_debt":
+            debt_id = int(request.form.get("debt_id", 0))
+            amount = int(request.form.get("amount", 0))
+            notes = request.form.get("notes", "")
+            if amount > 0:
+                debt = conn.execute("SELECT * FROM debts WHERE id=?", (debt_id,)).fetchone()
+                if debt:
+                    new_paid = debt["paid_amount"] + amount
+                    new_remaining = debt["total_amount"] - new_paid
+                    new_status = "paid" if new_remaining <= 0 else "partial" if new_paid > 0 else "unpaid"
+                    conn.execute("UPDATE debts SET paid_amount=?, remaining=?, status=? WHERE id=?",
+                        (new_paid, max(0, new_remaining), new_status, debt_id))
+                    conn.execute("INSERT INTO debt_payments (debt_id, amount, notes) VALUES (?, ?, ?)",
+                        (debt_id, amount, notes))
+                    conn.commit()
+        elif action == "delete_customer":
+            cid = int(request.form.get("customer_id", 0))
+            unpaid = conn.execute("SELECT COUNT(*) as c FROM debts WHERE customer_id=? AND status != 'paid'", (cid,)).fetchone()["c"]
+            if unpaid == 0:
+                conn.execute("DELETE FROM customers WHERE id=?", (cid,))
+                conn.commit()
+        return redirect(url_for("piutang"))
+
+    total_unpaid = conn.execute("SELECT COALESCE(SUM(remaining),0) as s FROM debts WHERE status='unpaid'").fetchone()["s"]
+    total_partial = conn.execute("SELECT COALESCE(SUM(remaining),0) as s FROM debts WHERE status='partial'").fetchone()["s"]
+    total_customers = conn.execute("SELECT COUNT(*) as c FROM customers").fetchone()["c"]
+
+    customer_debts = conn.execute("""
+        SELECT c.id, c.name, c.phone,
+            COALESCE(SUM(d.remaining),0) as total_remaining,
+            COUNT(CASE WHEN d.status != 'paid' THEN 1 END) as unpaid_count
+        FROM customers c
+        LEFT JOIN debts d ON d.customer_id = c.id
+        GROUP BY c.id ORDER BY total_remaining DESC
+    """).fetchall()
+
+    debts = conn.execute("""
+        SELECT d.*, c.name as customer_name, t.id as trx_id
+        FROM debts d
+        JOIN customers c ON c.id = d.customer_id
+        LEFT JOIN transactions t ON t.id = d.transaction_id
+        ORDER BY d.created_at DESC
+    """).fetchall()
+
+    customers = conn.execute("SELECT * FROM customers ORDER BY name").fetchall()
+    conn.close()
+
+    content = render_template_string('''
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+        <div class="bg-white rounded-xl shadow p-6">
+            <div class="text-gray-500 text-sm">Piutang Belum Bayar</div>
+            <div class="text-2xl font-bold text-red-500 mt-1">{{ r(total_unpaid) }}</div>
+        </div>
+        <div class="bg-white rounded-xl shadow p-6">
+            <div class="text-gray-500 text-sm">Piutang Sebagian</div>
+            <div class="text-2xl font-bold text-yellow-500 mt-1">{{ r(total_partial) }}</div>
+        </div>
+        <div class="bg-white rounded-xl shadow p-6">
+            <div class="text-gray-500 text-sm">Total Pelanggan</div>
+            <div class="text-2xl font-bold text-blue-500 mt-1">{{ total_customers }}</div>
+        </div>
+    </div>
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div class="lg:col-span-2 space-y-6">
+            <div class="bg-white rounded-xl shadow p-6">
+                <h3 class="font-semibold text-lg mb-4">👥 Daftar Pelanggan</h3>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead><tr class="border-b"><th class="text-left py-2">Nama</th><th class="text-left py-2">HP</th><th class="text-right py-2">Sisa Hutang</th><th class="text-right py-2">Transaksi</th></tr></thead>
+                        <tbody>
+                        {% for c in customer_debts %}
+                        <tr class="border-b hover:bg-gray-50">
+                            <td class="py-2 font-medium">{{ c.name }}</td>
+                            <td class="py-2 text-gray-500">{{ c.phone or '-' }}</td>
+                            <td class="py-2 text-right {{ 'text-red-500 font-semibold' if c.total_remaining > 0 else 'text-gray-400' }}">{{ r(c.total_remaining) }}</td>
+                            <td class="py-2 text-right">{{ c.unpaid_count }}</td>
+                        </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="bg-white rounded-xl shadow p-6">
+                <h3 class="font-semibold text-lg mb-4">📋 Daftar Piutang</h3>
+                <div class="space-y-3">
+                {% for d in debts %}
+                <div class="border rounded-lg p-4 {{ 'border-red-200 bg-red-50' if d.status=='unpaid' else 'border-yellow-200 bg-yellow-50' if d.status=='partial' else 'border-green-200 bg-green-50' }}">
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <div class="font-semibold">{{ d.customer_name }}</div>
+                            <div class="text-xs text-gray-500">#{{ d.trx_id or '-' }} — {{ d.created_at[:16] }}</div>
+                        </div>
+                        <div class="text-right">
+                            <div class="font-bold">{{ r(d.total_amount) }}</div>
+                            <div class="text-sm text-red-500">Sisa: {{ r(d.remaining) }}</div>
+                            <span class="text-xs px-2 py-1 rounded {{ 'bg-red-100 text-red-700' if d.status=='unpaid' else 'bg-yellow-100 text-yellow-700' if d.status=='partial' else 'bg-green-100 text-green-700' }}">
+                                {{ 'Belum Bayar' if d.status=='unpaid' else 'Sebagian' if d.status=='partial' else 'Lunas' }}
+                            </span>
+                        </div>
+                    </div>
+                    {% if d.status != 'paid' %}
+                    <form method="POST" class="mt-3 flex gap-2">
+                        <input type="hidden" name="action" value="pay_debt">
+                        <input type="hidden" name="debt_id" value="{{ d.id }}">
+                        <input type="number" name="amount" min="1" max="{{ d.remaining }}" placeholder="Jumlah" class="flex-1 border rounded px-3 py-1 text-sm">
+                        <input type="text" name="notes" placeholder="Catatan" class="w-32 border rounded px-3 py-1 text-sm">
+                        <button type="submit" class="bg-green-600 text-white px-4 py-1 rounded text-sm hover:bg-green-700">💰 Bayar</button>
+                    </form>
+                    {% endif %}
+                </div>
+                {% endfor %}
+                {% if not debts %}
+                <p class="text-gray-400 text-center py-8">Belum ada piutang</p>
+                {% endif %}
+                </div>
+            </div>
+        </div>
+        <div class="space-y-4">
+            <div class="bg-white rounded-xl shadow p-6">
+                <h3 class="font-semibold text-lg mb-4">➕ Tambah Pelanggan</h3>
+                <form method="POST">
+                    <input type="hidden" name="action" value="add_customer">
+                    <div class="space-y-3">
+                        <input name="name" required placeholder="Nama" class="w-full border rounded-lg px-3 py-2">
+                        <input name="phone" placeholder="No. HP" class="w-full border rounded-lg px-3 py-2">
+                        <input name="address" placeholder="Alamat" class="w-full border rounded-lg px-3 py-2">
+                        <button type="submit" class="w-full bg-indigo-600 text-white py-2 rounded-lg hover:bg-indigo-700">Tambah</button>
+                    </div>
+                </form>
+            </div>
+            <div class="bg-white rounded-xl shadow p-6">
+                <h3 class="font-semibold text-sm mb-3 text-gray-600">🗑️ Hapus Pelanggan</h3>
+                <form method="POST" onsubmit="return confirm('Yakin hapus?')">
+                    <input type="hidden" name="action" value="delete_customer">
+                    <select name="customer_id" class="w-full border rounded-lg px-3 py-2 text-sm mb-2">
+                        {% for c in customers %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+                    </select>
+                    <button type="submit" class="w-full bg-red-500 text-white py-2 rounded-lg text-sm hover:bg-red-600">Hapus</button>
+                </form>
+            </div>
+        </div>
+    </div>
+    ''', total_unpaid=total_unpaid, total_partial=total_partial, total_customers=total_customers,
+        customer_debts=customer_debts, debts=debts, customers=customers, r=rupiah)
+
+    return render_template_string(LAYOUT, title="Piutang", page="piutang", content=content, now=now_str())
+
+
+@app.route("/retur", methods=["GET", "POST"])
+@login_required
+def retur():
+    conn = get_db()
+
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "process_return":
+            tid = int(request.form.get("transaction_id", 0))
+            product_id = int(request.form.get("product_id", 0))
+            qty = int(request.form.get("quantity", 0))
+            reason = request.form.get("reason", "")
+            item = conn.execute("SELECT * FROM transaction_items WHERE transaction_id=? AND product_id=?",
+                (tid, product_id)).fetchone()
+            if item and qty > 0 and qty <= item["quantity"]:
+                amount = item["price"] * qty
+                conn.execute("INSERT INTO returns (transaction_id, product_id, product_name, quantity, amount, reason, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (tid, product_id, item["product_name"], qty, amount, reason, session.get("user_id")))
+                conn.execute("UPDATE products SET stock = stock + ?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (qty, product_id))
+                conn.execute("INSERT INTO finance (type, amount, description, category) VALUES ('expense', ?, ?, 'retur')",
+                    (amount, f"Retur #{tid} - {item['product_name']} x{qty}"))
+                conn.commit()
+        return redirect(url_for("retur"))
+
+    returns = conn.execute("SELECT r.*, t.id as trx_id FROM returns r LEFT JOIN transactions t ON t.id = r.transaction_id ORDER BY r.created_at DESC LIMIT 50").fetchall()
+    total_returns = conn.execute("SELECT COALESCE(SUM(amount),0) as s FROM returns").fetchone()["s"]
+    conn.close()
+
+    content = render_template_string('''
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+        <div class="bg-white rounded-xl shadow p-6">
+            <div class="text-gray-500 text-sm">Total Retur</div>
+            <div class="text-2xl font-bold text-red-500 mt-1">{{ r(total_returns) }}</div>
+        </div>
+    </div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-white rounded-xl shadow p-6">
+            <h3 class="font-semibold text-lg mb-4">📦 Proses Retur</h3>
+            <form method="POST" id="returnForm">
+                <input type="hidden" name="action" value="process_return">
+                <div class="space-y-3">
+                    <div>
+                        <label class="text-sm text-gray-600">No. Transaksi</label>
+                        <input type="number" name="transaction_id" id="trxIdInput" required placeholder="Nomor transaksi" class="w-full border rounded-lg px-3 py-2" onchange="loadTrxItems()">
+                    </div>
+                    <div>
+                        <label class="text-sm text-gray-600">Barang</label>
+                        <select name="product_id" id="productSelect" class="w-full border rounded-lg px-3 py-2" required>
+                            <option value="">-- Pilih transaksi dulu --</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="text-sm text-gray-600">Jumlah Retur</label>
+                        <input type="number" name="quantity" id="qtyInput" min="1" value="1" class="w-full border rounded-lg px-3 py-2">
+                    </div>
+                    <div>
+                        <label class="text-sm text-gray-600">Alasan</label>
+                        <input type="text" name="reason" placeholder="Rusak/salah beli/dll" class="w-full border rounded-lg px-3 py-2">
+                    </div>
+                    <button type="submit" class="w-full bg-red-600 text-white py-2 rounded-lg hover:bg-red-700">📦 Proses Retur</button>
+                </div>
+            </form>
+        </div>
+        <div class="bg-white rounded-xl shadow p-6">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="font-semibold text-lg">📋 Riwayat Retur</h3>
+                <a href="/export/retur" class="bg-green-600 text-white px-3 py-1 rounded text-sm hover:bg-green-700">📥 CSV</a>
+            </div>
+            <div class="space-y-3 max-h-96 overflow-y-auto">
+                {% for ret in returns %}
+                <div class="border-b pb-3">
+                    <div class="flex justify-between">
+                        <span class="font-medium">{{ ret.product_name }}</span>
+                        <span class="text-red-500 font-semibold">{{ r(ret.amount) }}</span>
+                    </div>
+                    <div class="text-xs text-gray-500">Trx #{{ ret.trx_id }} × {{ ret.quantity }} — {{ ret.reason or '-' }}</div>
+                    <div class="text-xs text-gray-400">{{ ret.created_at[:16] }}</div>
+                </div>
+                {% endfor %}
+                {% if not returns %}<p class="text-gray-400 text-center py-4">Belum ada retur</p>{% endif %}
+            </div>
+        </div>
+    </div>
+    <script>
+        async function loadTrxItems() {
+            const tid = document.getElementById('trxIdInput').value;
+            const select = document.getElementById('productSelect');
+            if (!tid) { select.innerHTML = '<option value="">-- Pilih transaksi dulu --</option>'; return; }
+            try {
+                const resp = await fetch('/api/transaction/' + tid + '/items');
+                const items = await resp.json();
+                select.innerHTML = '<option value="">-- Pilih barang --</option>';
+                items.forEach(item => {
+                    select.innerHTML += '<option value="' + item.product_id + '">' + item.product_name + ' (max: ' + item.quantity + ')</option>';
+                });
+                if (items.length === 0) select.innerHTML = '<option value="">Transaksi tidak ditemukan</option>';
+            } catch(e) { select.innerHTML = '<option value="">Error loading</option>'; }
+        }
+    </script>
+    ''', returns=returns, total_returns=total_returns, r=rupiah)
+    return render_template_string(LAYOUT, title="Retur Barang", page="retur", content=content, now=now_str())
+
+@app.route("/api/transaction/<int:tid>/items")
+@login_required
+def api_trx_items(tid):
+    conn = get_db()
+    items = conn.execute("SELECT product_id, product_name, quantity, price FROM transaction_items WHERE transaction_id=?", (tid,)).fetchall()
+    conn.close()
+    return jsonify([dict(i) for i in items])
+
+@app.route("/export/penjualan")
+@login_required
+def export_penjualan():
+    conn = get_db()
+    start = request.args.get("start", datetime.now().strftime("%Y-%m-%d"))
+    end = request.args.get("end", datetime.now().strftime("%Y-%m-%d"))
+    transactions = conn.execute("""
+        SELECT t.*, GROUP_CONCAT(ti.product_name || ' x' || ti.quantity, '; ') as items
+        FROM transactions t LEFT JOIN transaction_items ti ON ti.transaction_id = t.id
+        WHERE DATE(t.created_at) BETWEEN ? AND ? GROUP BY t.id ORDER BY t.created_at DESC
+    """, (start, end)).fetchall()
+    conn.close()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "Waktu", "Diskon", "PPN", "Total", "Bayar", "Kembali", "Items"])
+    for t in transactions:
+        writer.writerow([t["id"], t["created_at"], t["discount"] or 0, t["tax_amount"] or 0, t["total"], t["payment"], t["change_amount"], t["items"]])
+    return Response(output.getvalue(), mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=penjualan_{start}_{end}.csv"})
+
+@app.route("/export/pembukuan")
+@login_required
+def export_pembukuan():
+    conn = get_db()
+    start = request.args.get("start", datetime.now().strftime("%Y-%m-%d"))
+    end = request.args.get("end", datetime.now().strftime("%Y-%m-%d"))
+    records = conn.execute("SELECT * FROM finance WHERE DATE(created_at) BETWEEN ? AND ? ORDER BY created_at DESC", (start, end)).fetchall()
+    conn.close()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "Tanggal", "Tipe", "Jumlah", "Kategori", "Deskripsi"])
+    for r in records:
+        writer.writerow([r["id"], r["created_at"], r["type"], r["amount"], r["category"] or "", r["description"] or ""])
+    return Response(output.getvalue(), mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=pembukuan_{start}_{end}.csv"})
+
+@app.route("/export/retur")
+@login_required
+def export_retur():
+    conn = get_db()
+    returns = conn.execute("SELECT r.*, t.id as trx_id FROM returns r LEFT JOIN transactions t ON t.id = r.transaction_id ORDER BY r.created_at DESC").fetchall()
+    conn.close()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "Tanggal", "Trx ID", "Produk", "Jumlah", "Nominal", "Alasan"])
+    for r in returns:
+        writer.writerow([r["id"], r["created_at"], r["trx_id"] or "", r["product_name"], r["quantity"], r["amount"], r["reason"] or ""])
+    return Response(output.getvalue(), mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=retur.csv"})
+
 @app.route("/backup")
+@login_required
 def backup_page():
     import glob
     backup_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
