@@ -55,6 +55,18 @@ def init_db():
             category TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS ppob_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_type TEXT NOT NULL,
+            product_name TEXT NOT NULL,
+            customer_id TEXT NOT NULL,
+            selling_price INTEGER NOT NULL,
+            cost_price INTEGER NOT NULL,
+            profit INTEGER NOT NULL,
+            status TEXT DEFAULT 'success',
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """)
     # Seed sample products if empty
     if conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
@@ -121,6 +133,9 @@ LAYOUT = '''
                 </a>
                 <a href="/import" class="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-indigo-700 {{ 'bg-indigo-700' if page=='import' else '' }}">
                     <span>📥</span> Import Produk
+                </a>
+                <a href="/ppob" class="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-indigo-700 {{ 'bg-indigo-700' if page=='ppob' else '' }}">
+                    <span>⚡</span> PPOB (Token/Pulsa)
                 </a>
                 <a href="/kasir" class="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-indigo-700 {{ 'bg-indigo-700' if page=='kasir' else '' }}">
                     <span>💳</span> Kasir (POS)
@@ -1161,6 +1176,261 @@ def pembukuan():
         start=start, end=end, r=rupiah)
 
     return render_template_string(LAYOUT, title="Pembukuan", page="pembukuan", content=content, now=now_str())
+
+
+@app.route("/ppob", methods=["GET", "POST"])
+def ppob():
+    conn = get_db()
+
+    # PPOB Product Catalog
+    PPOB_PRODUCTS = {
+        "token_listrik": {
+            "name": "⚡ Token Listrik PLN",
+            "items": [
+                {"name": "Token Rp 20.000", "nominal": 20000, "cost": 19500, "admin": 1500},
+                {"name": "Token Rp 50.000", "nominal": 50000, "cost": 49200, "admin": 2000},
+                {"name": "Token Rp 100.000", "nominal": 100000, "cost": 98500, "admin": 2500},
+                {"name": "Token Rp 200.000", "nominal": 200000, "cost": 197000, "admin": 3000},
+                {"name": "Token Rp 500.000", "nominal": 500000, "cost": 494000, "admin": 3500},
+                {"name": "Token Rp 1.000.000", "nominal": 1000000, "cost": 988000, "admin": 5000},
+            ]
+        },
+        "pulsa": {
+            "name": "📱 Pulsa HP",
+            "items": [
+                {"name": "Pulsa Rp 5.000", "nominal": 5000, "cost": 4800, "admin": 1000},
+                {"name": "Pulsa Rp 10.000", "nominal": 10000, "cost": 9600, "admin": 1500},
+                {"name": "Pulsa Rp 15.000", "nominal": 15000, "cost": 14500, "admin": 1500},
+                {"name": "Pulsa Rp 20.000", "nominal": 20000, "cost": 19400, "admin": 1500},
+                {"name": "Pulsa Rp 25.000", "nominal": 25000, "cost": 24300, "admin": 1500},
+                {"name": "Pulsa Rp 50.000", "nominal": 50000, "cost": 48500, "admin": 2000},
+                {"name": "Pulsa Rp 100.000", "nominal": 100000, "cost": 97000, "admin": 2500},
+            ]
+        },
+        "paket_data": {
+            "name": "📶 Paket Data",
+            "items": [
+                {"name": "Data 1GB/30hr", "nominal": 15000, "cost": 13500, "admin": 1500},
+                {"name": "Data 2GB/30hr", "nominal": 25000, "cost": 23000, "admin": 2000},
+                {"name": "Data 5GB/30hr", "nominal": 50000, "cost": 46000, "admin": 2500},
+                {"name": "Data 10GB/30hr", "nominal": 80000, "cost": 74000, "admin": 3000},
+                {"name": "Data 25GB/30hr", "nominal": 100000, "cost": 92000, "admin": 3000},
+            ]
+        },
+        "tagihan": {
+            "name": "📋 Tagihan & Pembayaran",
+            "items": [
+                {"name": "BPJS Kesehatan", "nominal": 0, "cost": 0, "admin": 2500},
+                {"name": "PDAM", "nominal": 0, "cost": 0, "admin": 2500},
+                {"name": "Telkom/IndiHome", "nominal": 0, "cost": 0, "admin": 2500},
+                {"name": "TV Berlangganan", "nominal": 0, "cost": 0, "admin": 2500},
+            ]
+        }
+    }
+
+    if request.method == "POST":
+        action = request.form.get("action")
+
+        if action == "sell":
+            product_type = request.form["product_type"]
+            product_name = request.form["product_name"]
+            customer_id = request.form["customer_id"]
+            selling_price = int(request.form["selling_price"])
+            cost_price = int(request.form["cost_price"])
+            profit = selling_price - cost_price
+            notes = request.form.get("notes", "")
+
+            conn.execute("""
+                INSERT INTO ppob_transactions (product_type, product_name, customer_id, selling_price, cost_price, profit, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (product_type, product_name, customer_id, selling_price, cost_price, profit, notes))
+
+            # Auto-record income
+            conn.execute("""
+                INSERT INTO finance (type, amount, description, category) VALUES ('income', ?, ?, 'ppob')
+            """, (profit, f"PPOB: {product_name} - {customer_id}"))
+
+            conn.commit()
+            conn.close()
+            return redirect(url_for("ppob"))
+
+    # Get PPOB stats
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_stats = conn.execute("""
+        SELECT COUNT(*) as count, COALESCE(SUM(profit),0) as profit
+        FROM ppob_transactions WHERE DATE(created_at) = ?
+    """, (today,)).fetchone()
+
+    month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
+    month_stats = conn.execute("""
+        SELECT COUNT(*) as count, COALESCE(SUM(profit),0) as profit
+        FROM ppob_transactions WHERE DATE(created_at) >= ?
+    """, (month_start,)).fetchone()
+
+    recent = conn.execute("""
+        SELECT * FROM ppob_transactions ORDER BY created_at DESC LIMIT 10
+    """).fetchall()
+
+    conn.close()
+
+    content = render_template_string('''
+    <!-- Stats -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+        <div class="bg-white rounded-xl shadow p-4 text-center">
+            <div class="text-2xl font-bold text-yellow-600">{{ today.count }}</div>
+            <div class="text-sm text-gray-500">Transaksi Hari Ini</div>
+        </div>
+        <div class="bg-white rounded-xl shadow p-4 text-center">
+            <div class="text-2xl font-bold text-green-600">{{ r(today.profit) }}</div>
+            <div class="text-sm text-gray-500">Profit Hari Ini</div>
+        </div>
+        <div class="bg-white rounded-xl shadow p-4 text-center">
+            <div class="text-2xl font-bold text-purple-600">{{ r(month.profit) }}</div>
+            <div class="text-sm text-gray-500">Profit Bulan Ini ({{ month.count }} trx)</div>
+        </div>
+    </div>
+
+    <!-- Product Catalog -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+        {% for type, cat in products.items() %}
+        <div class="bg-white rounded-xl shadow p-6">
+            <h3 class="font-semibold text-lg mb-4">{{ cat.name }}</h3>
+            <div class="space-y-2">
+                {% for item in cat['items'] %}
+                <div class="flex justify-between items-center p-2 bg-gray-50 rounded hover:bg-gray-100">
+                    <div>
+                        <div class="font-medium text-sm">{{ item.name }}</div>
+                        <div class="text-xs text-gray-400">Modal: {{ r(item.cost) }} | Admin: {{ r(item.admin) }}</div>
+                    </div>
+                    <div class="text-right">
+                        <div class="font-semibold text-green-600">{{ r(item.nominal + item.admin if item.nominal > 0 else item.admin) }}</div>
+                        <div class="text-xs text-gray-400">Profit: {{ r(item.nominal + item.admin - item.cost if item.nominal > 0 else item.admin) }}</div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <!-- Quick Sell Form -->
+    <div class="bg-white rounded-xl shadow p-6 mb-6">
+        <h3 class="font-semibold text-lg mb-4">💰 Catat Transaksi PPOB</h3>
+        <form method="POST" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            <input type="hidden" name="action" value="sell">
+            <div>
+                <label class="text-sm text-gray-500">Tipe Produk</label>
+                <select name="product_type" id="ppobType" onchange="updateProducts()" class="w-full border rounded-lg px-3 py-2">
+                    {% for type, cat in products.items() %}
+                    <option value="{{ type }}">{{ cat.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label class="text-sm text-gray-500">Produk</label>
+                <select name="product_name" id="ppobProduct" onchange="updatePrice()" class="w-full border rounded-lg px-3 py-2">
+                    {% for item in products.token_listrik['items'] %}
+                    <option value="{{ item.name }}" data-cost="{{ item.cost }}" data-price="{{ item.nominal + item.admin }}">{{ item.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label class="text-sm text-gray-500">No. Meter/HP</label>
+                <input name="customer_id" placeholder="Contoh: 12345678901" required class="w-full border rounded-lg px-3 py-2">
+            </div>
+            <div>
+                <label class="text-sm text-gray-500">Harga Jual (Rp)</label>
+                <input name="selling_price" id="sellPrice" type="number" required class="w-full border rounded-lg px-3 py-2">
+                <input type="hidden" name="cost_price" id="costPrice">
+            </div>
+            <div class="md:col-span-2 lg:col-span-4">
+                <label class="text-sm text-gray-500">Catatan (opsional)</label>
+                <input name="notes" placeholder="Catatan tambahan..." class="w-full border rounded-lg px-3 py-2">
+            </div>
+            <div class="md:col-span-2 lg:col-span-4">
+                <button type="submit" class="bg-yellow-500 text-white px-6 py-3 rounded-lg hover:bg-yellow-600 font-semibold">
+                    ⚡ Catat Transaksi
+                </button>
+            </div>
+        </form>
+    </div>
+
+    <!-- Recent Transactions -->
+    <div class="bg-white rounded-xl shadow overflow-hidden">
+        <div class="px-6 py-4 border-b">
+            <h3 class="font-semibold">📋 Transaksi Terakhir</h3>
+        </div>
+        <table class="w-full">
+            <thead class="bg-gray-50">
+                <tr>
+                    <th class="px-4 py-3 text-left text-sm font-semibold text-gray-600">Waktu</th>
+                    <th class="px-4 py-3 text-left text-sm font-semibold text-gray-600">Produk</th>
+                    <th class="px-4 py-3 text-left text-sm font-semibold text-gray-600">No. Meter/HP</th>
+                    <th class="px-4 py-3 text-right text-sm font-semibold text-gray-600">Harga</th>
+                    <th class="px-4 py-3 text-right text-sm font-semibold text-gray-600">Profit</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y">
+                {% for t in recent %}
+                <tr class="hover:bg-gray-50">
+                    <td class="px-4 py-3 text-sm">{{ t.created_at[:16] }}</td>
+                    <td class="px-4 py-3">{{ t.product_name }}</td>
+                    <td class="px-4 py-3 font-mono text-sm">{{ t.customer_id }}</td>
+                    <td class="px-4 py-3 text-right">{{ r(t.selling_price) }}</td>
+                    <td class="px-4 py-3 text-right text-green-600 font-semibold">+{{ r(t.profit) }}</td>
+                </tr>
+                {% endfor %}
+                {% if not recent %}
+                <tr><td colspan="5" class="px-4 py-8 text-center text-gray-400">Belum ada transaksi PPOB</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Info -->
+    <div class="bg-blue-50 rounded-xl p-6 mt-6">
+        <h3 class="font-semibold text-blue-800 mb-2">💡 Tips PPOB</h3>
+        <ul class="text-sm text-blue-700 space-y-1">
+            <li>• Daftar di <strong>Digiflazz.com</strong> untuk harga terbaik & API otomatis</li>
+            <li>• Deposit minimal Rp 10.000, langsung bisa jualan</li>
+            <li>• Harga di atas adalah estimasi — sesuaikan dengan platform yang lu pakai</li>
+            <li>• Profit terbesar: Token listrik Rp 1.000.000 (bisa Rp 7.000-12.000 per trx)</li>
+            <li>• Semakin banyak transaksi, semakin murah harga beli (tier system)</li>
+        </ul>
+    </div>
+
+    <script>
+        const products = {{ products_json|safe }};
+
+        function updateProducts() {
+            const type = document.getElementById('ppobType').value;
+            const select = document.getElementById('ppobProduct');
+            select.innerHTML = '';
+            products[type]['items'].forEach(item => {
+                const opt = document.createElement('option');
+                opt.value = item.name;
+                opt.dataset.cost = item.cost;
+                opt.dataset.price = item.nominal > 0 ? item.nominal + item.admin : item.admin;
+                opt.textContent = item.name;
+                select.appendChild(opt);
+            });
+            updatePrice();
+        }
+
+        function updatePrice() {
+            const opt = document.getElementById('ppobProduct').selectedOptions[0];
+            if (opt) {
+                document.getElementById('sellPrice').value = opt.dataset.price;
+                document.getElementById('costPrice').value = opt.dataset.cost;
+            }
+        }
+
+        updatePrice();
+    </script>
+    ''', products=PPOB_PRODUCTS, products_json=json.dumps(PPOB_PRODUCTS),
+        today=today_stats, month=month_stats, recent=recent, r=rupiah)
+
+    return render_template_string(LAYOUT, title="PPOB (Token/Pulsa)", page="ppob", content=content, now=now_str())
 
 
 @app.route("/backup")
